@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+sqlalchemy
+pyjwt
+python-multipart
+httpx
+pytest
+bcrypt
