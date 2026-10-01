@@ -33,7 +33,7 @@ def test_full_loop():
                files={"file": (f"{d}.pdf", io.BytesIO(b"x"))})
 
     r = c.post(f"/applications/{aid}/submit", headers=H(tok)).json()
-    assert r["eligibility"]["result"] == "ELIGIBLE"
+    assert r["eligibility"]["result"] == "NEEDS_REVIEW"
 
     off = c.post("/auth/login", json={"email": "officer@mota.test", "password": "password123"}).json()["token"]
     assert any(q["id"] == aid for q in c.get("/officer/queue", headers=H(off)).json())
@@ -108,3 +108,48 @@ def test_upload_hardening():
     assert up("caste_certificate", "b.pdf").status_code == 200   # replaces
     docs = c.get(f"/applications/{aid}", headers=H(tok)).json()["documents"]
     assert len(docs) == 1 and docs[0]["filename"] == "b.pdf"
+
+def test_clean_documents_stay_eligible(monkeypatch):
+    # Pretend OCR read every document correctly and the values match the form.
+    fake = {
+        "caste_certificate": {"name": "Test User", "category": "ST", "certificate_no": "ST/1"},
+        "income_certificate": {"name": "Test User", "family_income": "300000"},
+        "marksheet": {"name": "Test User", "pg_percentage": "72"},
+        "admission_proof": {"name": "Test User"},
+    }
+    monkeypatch.setattr("app.main.extract_document",
+                        lambda path, doc_type: {"fields": fake[doc_type], "ocr_conf": 90.0, "error": None})
+
+    tok = c.post("/auth/register", json={"email": "ok@x.com", "password": "pw12345"}).json()["token"]
+    sid = c.get("/schemes").json()[0]["id"]
+    aid = c.post("/applications", headers=H(tok), json={"scheme_id": sid}).json()["id"]
+    c.put(f"/applications/{aid}", headers=H(tok),
+          json={"category": "ST", "family_income": 300000, "enrolled_in_phd": True, "pg_percentage": 72})
+    for d in fake:
+        c.post(f"/applications/{aid}/documents?doc_type={d}", headers=H(tok),
+               files={"file": (f"{d}.pdf", io.BytesIO(b"x"))})
+    r = c.post(f"/applications/{aid}/submit", headers=H(tok)).json()
+    assert r["eligibility"]["result"] == "ELIGIBLE"
+
+
+def test_mismatch_downgrades_to_needs_review(monkeypatch):
+    fake = {
+        "caste_certificate": {"category": "ST"},
+        "income_certificate": {"family_income": "300000"},
+        "marksheet": {"pg_percentage": "55"},   # form says 72 -> mismatch
+        "admission_proof": {},
+    }
+    monkeypatch.setattr("app.main.extract_document",
+                        lambda path, doc_type: {"fields": fake[doc_type], "ocr_conf": 90.0, "error": None})
+
+    tok = c.post("/auth/register", json={"email": "mm@x.com", "password": "pw12345"}).json()["token"]
+    sid = c.get("/schemes").json()[0]["id"]
+    aid = c.post("/applications", headers=H(tok), json={"scheme_id": sid}).json()["id"]
+    c.put(f"/applications/{aid}", headers=H(tok),
+          json={"category": "ST", "family_income": 300000, "enrolled_in_phd": True, "pg_percentage": 72})
+    for d in fake:
+        c.post(f"/applications/{aid}/documents?doc_type={d}", headers=H(tok),
+               files={"file": (f"{d}.pdf", io.BytesIO(b"x"))})
+    r = c.post(f"/applications/{aid}/submit", headers=H(tok)).json()
+    assert r["eligibility"]["result"] == "NEEDS_REVIEW"
+    assert any(x["rule"] == "AI document cross-check" for x in r["eligibility"]["reasons"])    

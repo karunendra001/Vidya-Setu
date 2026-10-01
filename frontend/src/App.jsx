@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Routes, Route, Navigate, Link, useNavigate } from "react-router-dom";
 import { api, getToken, setToken } from "./api";
-import { Login, Dashboard, ApplicationPage, Queue, Review } from "./pages.jsx";
+import { Login, Dashboard, ApplicationPage, Queue, Review, Ranking, Ministry} from "./pages.jsx";
 
 export default function App() {
   const [user, setUser] = useState(null);
@@ -33,16 +33,26 @@ export default function App() {
           </div>
         )}
       </header>
-      {user && <nav className="nav"><Link to="/">{staff ? "Verification queue" : "My applications"}</Link></nav>}
+
+      {user && (
+        <nav className="nav">
+          <Link to="/">{staff ? "Verification queue" : "My applications"}</Link>
+          {staff && <Link to="/ranking">Merit list</Link>}
+          {user && ["approver", "admin"].includes(user.role) && <Link to="/ministry">Dashboard</Link>}
+        </nav>
+      )}
+
       <main className="page">
         <Routes>
           <Route path="/login" element={user ? <Navigate to="/" /> : <Login onLogin={setUser} />} />
           <Route path="/" element={!user ? <Navigate to="/login" /> : staff ? <Queue /> : <Dashboard />} />
           <Route path="/apply/:id" element={user ? <ApplicationPage /> : <Navigate to="/login" />} />
           <Route path="/review/:id" element={staff ? <Review /> : <Navigate to="/" />} />
+          <Route path="/ranking" element={staff ? <Ranking user={user} /> : <Navigate to="/" />} />
+          <Route path="/ministry" element={user && ["approver", "admin"].includes(user.role) ? <Ministry /> : <Navigate to="/" />} />
         </Routes>
       </main>
-      <footer className="foot">Vidya Setu · Prototype for Smart India Hackathon 2026 (SIH26239)</footer>
+      <footer className="foot">Vidya Setu | Scholarship & Fellowship Portal</footer>
     </>
   );
 }

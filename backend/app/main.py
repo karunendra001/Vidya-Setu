@@ -4,12 +4,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from sqlalchemy import select
+from sqlalchemy import select, func
 
 from .db import Base, engine, get_db
-from .models import User, Scheme, Application, Document, AuditLog
+from .models import User, Scheme, Application, Document, AuditLog, RankOverride
 from .security import hash_password, verify_password, make_token, current_user, require_roles
 from .rules import evaluate, missing_documents
+from .ocr_service import extract_document, compare_documents, overall_status
+from .ranking import score_application, build_ranking
+from .analytics import compute_dashboard
 
 Base.metadata.create_all(engine)
 # Private folder: never mounted as static files. Served only via /documents/{id}/download.
@@ -18,6 +21,8 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 ALLOWED_EXT = {".pdf", ".jpg", ".jpeg", ".png"}
 STAFF = ("officer", "approver", "admin")
+COMMITTEE = ("approver", "admin")
+FINAL = ("SELECTED", "WAITLISTED", "NOT_SELECTED")
 
 app = FastAPI(title="Vidya Setu: MoTA Scholarship & Fellowship Management System")
 
@@ -164,6 +169,12 @@ def _app_out(db: Session, a: Application) -> dict:
 def _can_view(a: Application, user: User) -> bool:
     return a.user_id == user.id or user.role in STAFF
 
+def _doc_checks(db: Session, a: Application) -> list:
+    docs = db.scalars(select(Document).where(Document.application_id == a.id)).all()
+    applicant = db.get(User, a.user_id)
+    return compare_documents([(d.doc_type, d.ocr_data) for d in docs],
+                             a.form_data or {}, applicant.full_name if applicant else "")    
+
 
 @app.post("/applications/{app_id}/documents")
 def upload_document(app_id: int, doc_type: str, file: UploadFile = File(...),
@@ -200,7 +211,8 @@ def upload_document(app_id: int, doc_type: str, file: UploadFile = File(...),
             os.remove(old.path)
         db.delete(old)
     d = Document(application_id=a.id, doc_type=doc_type,
-                 filename=os.path.basename(file.filename), path=path)
+                 filename=os.path.basename(file.filename), path=path,
+                 ocr_data=extract_document(path, doc_type))
     db.add(d); db.commit()
     return _doc_out(d)
 
@@ -221,12 +233,24 @@ def submit(app_id: int, db: Session = Depends(get_db),
              if a.form_data.get(f["name"]) in (None, "")]
     if empty:
         raise HTTPException(400, {"message": "Please fill all details", "missing": empty})
+
     a.eligibility = evaluate(cfg.get("eligibility_rules", []), a.form_data)
+    checks = _doc_checks(db, a)
+    doc_status = overall_status(checks)
+    # OCR can only move ELIGIBLE -> NEEDS_REVIEW. It never produces NOT_ELIGIBLE.
+    if doc_status in ("mismatch", "review"):
+        a.eligibility = {
+            **a.eligibility,
+            "result": "NEEDS_REVIEW" if a.eligibility["result"] == "ELIGIBLE" else a.eligibility["result"],
+            "reasons": a.eligibility["reasons"] + [{
+                "rule": "AI document cross-check", "passed": None,
+                "why": "Differences found between documents and form. Officer to verify."}],
+        }
     a.status = "SUBMITTED"
     audit(db, user, "SUBMIT", "application", a.id, {"eligibility": a.eligibility["result"]})
     db.commit()
     return {"status": a.status, "eligibility": a.eligibility}
-
+    
 
 @app.get("/applications/mine")
 def my_applications(db: Session = Depends(get_db),
@@ -249,6 +273,8 @@ def get_application(app_id: int, db: Session = Depends(get_db),
         applicant = db.get(User, a.user_id)
         out["applicant"] = {"id": applicant.id, "full_name": applicant.full_name,
                             "email": applicant.email}
+        out["doc_checks"] = _doc_checks(db, a)
+        out["doc_status"] = overall_status(out["doc_checks"])                    
     return out
 
 
@@ -303,3 +329,143 @@ def decide(app_id: int, body: DecisionIn, db: Session = Depends(get_db),
     audit(db, officer, "DECISION", "application", a.id, {"decision": body.decision, "note": body.note})
     db.commit()
     return {"id": a.id, "status": a.status}
+
+@app.post("/officer/documents/{doc_id}/reverify")
+def reverify(doc_id: int, db: Session = Depends(get_db),
+             officer: User = Depends(require_roles(*STAFF))):
+    d = db.get(Document, doc_id)
+    if not d or not os.path.exists(d.path):
+        raise HTTPException(404, "Document not found")
+    d.ocr_data = extract_document(d.path, d.doc_type)
+    audit(db, officer, "REVERIFY_DOCUMENT", "document", d.id)
+    db.commit()
+    return d.ocr_data    
+
+# ---------- Selection committee ----------
+def _ranking(db: Session, scheme: Scheme) -> dict:
+    cfg = scheme.config or {}
+    sel = cfg.get("selection", {})
+    slots, waitlist = int(sel.get("slots", 0)), int(sel.get("waitlist", 0))
+    apps = db.scalars(select(Application).where(
+        Application.scheme_id == scheme.id,
+        Application.status.in_(("VERIFIED",) + FINAL))).all()
+    cands = []
+    for a in apps:
+        u = db.get(User, a.user_id)
+        score, breakdown = score_application(cfg.get("scoring", {}), a.form_data or {})
+        cands.append({"application_id": a.id, "name": (u.full_name or u.email) if u else "?",
+                      "score": score, "breakdown": breakdown, "status": a.status,
+                      "eligibility": (a.eligibility or {}).get("result")})
+    ovr = {o.application_id: {"action": o.action, "rank": o.rank, "reason": o.reason}
+           for o in db.scalars(select(RankOverride).where(RankOverride.scheme_id == scheme.id))}
+    ranked, excluded = build_ranking(cands, ovr, slots, waitlist)
+    return {"scheme": {"id": scheme.id, "name": scheme.name}, "slots": slots, "waitlist": waitlist,
+            "published": any(c["status"] in FINAL for c in cands),
+            "ranked": ranked, "excluded": excluded}
+
+
+@app.get("/committee/schemes/{scheme_id}/ranking")
+def get_ranking(scheme_id: int, db: Session = Depends(get_db),
+                user: User = Depends(require_roles(*STAFF))):
+    scheme = db.get(Scheme, scheme_id)
+    if not scheme:
+        raise HTTPException(404, "Scheme not found")
+    return _ranking(db, scheme)
+
+
+class OverrideIn(BaseModel):
+    application_id: int
+    action: str                 # PIN | EXCLUDE | CLEAR
+    rank: int | None = None
+    reason: str = ""
+
+
+@app.post("/committee/schemes/{scheme_id}/overrides")
+def set_override(scheme_id: int, body: OverrideIn, db: Session = Depends(get_db),
+                 user: User = Depends(require_roles(*COMMITTEE))):
+    scheme = db.get(Scheme, scheme_id)
+    if not scheme:
+        raise HTTPException(404, "Scheme not found")
+    if _ranking(db, scheme)["published"]:
+        raise HTTPException(400, "Results are already published")
+    if body.action not in ("PIN", "EXCLUDE", "CLEAR"):
+        raise HTTPException(400, "Action must be PIN, EXCLUDE or CLEAR")
+    a = db.get(Application, body.application_id)
+    if not a or a.scheme_id != scheme.id or a.status != "VERIFIED":
+        raise HTTPException(404, "No verified application with that id in this scheme")
+    existing = db.scalar(select(RankOverride).where(RankOverride.application_id == a.id))
+    if body.action == "CLEAR":
+        if existing:
+            db.delete(existing)
+    else:
+        if not body.reason.strip():
+            raise HTTPException(400, "A reason is mandatory for every override")
+        if body.action == "PIN" and (body.rank is None or body.rank < 1):
+            raise HTTPException(400, "Give the rank position to pin to (1 or more)")
+        rank = body.rank if body.action == "PIN" else None
+        if existing:
+            existing.action, existing.rank = body.action, rank
+            existing.reason, existing.set_by = body.reason.strip(), user.id
+        else:
+            db.add(RankOverride(scheme_id=scheme.id, application_id=a.id, action=body.action,
+                                rank=rank, reason=body.reason.strip(), set_by=user.id))
+    audit(db, user, "RANK_OVERRIDE", "application", a.id,
+          {"action": body.action, "rank": body.rank, "reason": body.reason})
+    db.commit()
+    return _ranking(db, scheme)
+
+
+@app.post("/committee/schemes/{scheme_id}/publish")
+def publish_results(scheme_id: int, db: Session = Depends(get_db),
+                    user: User = Depends(require_roles(*COMMITTEE))):
+    scheme = db.get(Scheme, scheme_id)
+    if not scheme:
+        raise HTTPException(404, "Scheme not found")
+    r = _ranking(db, scheme)
+    if r["published"]:
+        raise HTTPException(400, "Results are already published")
+    if not r["slots"]:
+        raise HTTPException(400, "No slots configured for this scheme")
+    if not r["ranked"]:
+        raise HTTPException(400, "No verified applications to rank")
+    n = len(r["ranked"])
+    for row in r["ranked"]:
+        a = db.get(Application, row["application_id"])
+        a.status = row["decision"]
+        a.officer_note = f"Result: {row['decision'].replace('_', ' ')} (merit rank {row['rank']} of {n})."
+    for row in r["excluded"]:
+        a = db.get(Application, row["application_id"])
+        a.status = "NOT_SELECTED"
+        a.officer_note = "Result: NOT SELECTED (removed by the selection committee)."
+    audit(db, user, "PUBLISH_RESULTS", "scheme", scheme.id, {
+        "slots": r["slots"], "waitlist": r["waitlist"],
+        "snapshot": [{"application_id": x["application_id"], "rank": x["rank"], "score": x["score"],
+                      "decision": x["decision"], "override": x["override"]} for x in r["ranked"]]
+                    + [{"application_id": x["application_id"], "decision": "EXCLUDED",
+                        "override": x["override"]} for x in r["excluded"]]})
+    db.commit()
+    return {"published": True,
+            "selected": sum(1 for x in r["ranked"] if x["decision"] == "SELECTED"),
+            "waitlisted": sum(1 for x in r["ranked"] if x["decision"] == "WAITLISTED")}
+
+# ---------- Ministry dashboard ----------
+@app.get("/ministry/dashboard")
+def ministry_dashboard(db: Session = Depends(get_db),
+                       user: User = Depends(require_roles(*COMMITTEE))):
+    apps = [{"id": a.id, "scheme_id": a.scheme_id, "status": a.status,
+             "form_data": a.form_data or {},
+             "eligibility_result": (a.eligibility or {}).get("result"),
+             "created_at": a.created_at} for a in db.scalars(select(Application))]
+    events = [{"application_id": e.entity_id, "action": e.action, "actor_id": e.actor_id,
+               "at": e.at, "detail": e.detail or {}}
+              for e in db.scalars(select(AuditLog).where(
+                  AuditLog.entity == "application",
+                  AuditLog.action.in_(("SUBMIT", "DECISION"))))]
+    schemes = {s.id: s.name for s in db.scalars(select(Scheme))}
+    names = {u.id: (u.full_name or u.email)
+             for u in db.scalars(select(User).where(User.role.in_(STAFF)))}
+    out = compute_dashboard(apps, events, schemes, names)
+    out["has_demo_data"] = bool(db.scalar(
+        select(func.count()).select_from(User).where(User.email.like("%@example.test"))))
+    return out
+     

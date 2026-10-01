@@ -18,6 +18,7 @@ NFST = {
         {"label": "Enrolled in research programme", "field": "enrolled_in_phd", "operator": "equals", "value": True},
     ],
     "scoring": {"pg_percentage": 1.0},
+    "selection": {"slots": 3, "waitlist": 2},
 }
 
 
