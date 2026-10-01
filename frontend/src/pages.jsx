@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import { useNavigate, useParams, Link } from "react-router-dom";
 import { api, setToken, openDocument } from "./api";
+import { BarChart, Bar, XAxis, YAxis, Tooltip, Legend, CartesianGrid, ResponsiveContainer, PieChart, Pie, Cell } from "recharts";
 
 const label = (s) => s.replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase());
 const Badge = ({ s }) => <span className={"badge " + s}>{s}</span>;
@@ -74,12 +75,16 @@ export function Dashboard() {
   );
 }
 
-const STEPS = ["DRAFT", "SUBMITTED", "VERIFIED"];
+const STEPS = ["DRAFT", "SUBMITTED", "VERIFIED", "RESULT"];
+const STEP_LABEL = { DRAFT: "Draft", SUBMITTED: "Under verification", VERIFIED: "Verified", RESULT: "Result" };
 function Tracker({ status }) {
-  const i = status === "REJECTED" ? 1 : Math.max(0, STEPS.indexOf(status === "DEFICIENT" ? "DRAFT" : status));
+  const key = status === "DEFICIENT" ? "DRAFT"
+    : ["SELECTED", "WAITLISTED", "NOT_SELECTED"].includes(status) ? "RESULT"
+    : status === "REJECTED" ? "SUBMITTED" : status;
+  const i = Math.max(0, STEPS.indexOf(key));
   return (
     <ol className="tracker">
-      {STEPS.map((s, n) => <li key={s} className={n <= i ? "done" : ""}>{s === "DRAFT" ? "Draft" : s === "SUBMITTED" ? "Under verification" : "Verified"}</li>)}
+      {STEPS.map((s, n) => <li key={s} className={n <= i ? "done" : ""}>{STEP_LABEL[s]}</li>)}
     </ol>
   );
 }
@@ -193,6 +198,29 @@ export function Queue() {
   );
 }
 
+const CHECK_COLOR = { match: "#138808", review: "#d97706", mismatch: "#b91c1c", not_found: "#6b7280", info: "#6b7280" };
+
+function DocChecks({ checks }) {
+  if (!checks?.length) return null;
+  return (
+    <section className="card">
+      <h3>AI document cross-check <span className="muted">(assistive: the officer decides)</span></h3>
+      <table>
+        <thead><tr><th>Document</th><th>Field</th><th>Entered by applicant</th><th>Read from document</th><th>Result</th></tr></thead>
+        <tbody>{checks.map((c, i) => (
+          <tr key={i}>
+            <td>{label(c.doc_type)}</td><td>{label(c.field)}</td>
+            <td>{c.form_value || "—"}</td><td>{c.extracted_value || "—"}</td>
+            <td style={{ color: CHECK_COLOR[c.status], fontWeight: 600 }}>
+              {c.status.replace("_", " ").toUpperCase()}{c.score ? ` (${Math.round(c.score)}%)` : ""}
+            </td>
+          </tr>
+        ))}</tbody>
+      </table>
+    </section>
+  );
+}
+
 export function Review() {
   const { id } = useParams();
   const nav = useNavigate();
@@ -215,6 +243,7 @@ export function Review() {
         <table><tbody>{Object.entries(app.form_data).map(([k, v]) => <tr key={k}><th>{label(k)}</th><td>{String(v)}</td></tr>)}</tbody></table>
       </section>
       <section className="card"><h3>Documents</h3><Docs docs={app.documents} /></section>
+      <DocChecks checks={app.doc_checks} />
       <Eligibility e={app.eligibility} />
       {app.status === "SUBMITTED" ? (
         <section className="card">
@@ -229,6 +258,199 @@ export function Review() {
           </div>
         </section>
       ) : <p className="muted">This application has already been decided.</p>}
+    </>
+  );
+}
+
+export function Ranking({ user }) {
+  const [schemes, setSchemes] = useState([]);
+  const [sid, setSid] = useState("");
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState("");
+  const [msg, setMsg] = useState("");
+  const [f, setF] = useState({ application_id: "", action: "PIN", rank: 1, reason: "" });
+  const canOverride = user && ["approver", "admin"].includes(user.role);
+
+  useEffect(() => {
+    api("/schemes").then((s) => { setSchemes(s); if (s[0]) setSid(s[0].id); }).catch((e) => setErr(e.message));
+  }, []);
+  const load = () => { if (sid) api(`/committee/schemes/${sid}/ranking`).then(setData).catch((e) => { setErr(e.message); setData(null); }); };
+  useEffect(() => { load(); }, [sid]);
+
+  const act = async (fn, ok) => { setErr(""); setMsg(""); try { await fn(); setMsg(ok); load(); } catch (e) { setErr(e.message); } };
+  const override = () => act(() => api(`/committee/schemes/${sid}/overrides`, {
+    method: "POST",
+    body: { application_id: Number(f.application_id), action: f.action, rank: f.action === "PIN" ? Number(f.rank) : null, reason: f.reason },
+  }), "Override saved and logged.");
+  const publish = () => {
+    if (window.confirm("Publish results? This locks the ranking and notifies every applicant's status.")) {
+      act(() => api(`/committee/schemes/${sid}/publish`, { method: "POST" }), "Results published.");
+    }
+  };
+
+  if (!data) return <><Err e={err} /><p>Loading…</p></>;
+  const everyone = [...data.ranked, ...data.excluded];
+  return (
+    <>
+      <h2>Merit list · {data.scheme.name}</h2>
+      <p className="muted">Slots: {data.slots} · Waitlist: {data.waitlist} · Score = Σ (field value × weight). The ranking is a recommendation; the committee decides.</p>
+      <select value={sid} onChange={(e) => setSid(e.target.value)}>
+        {schemes.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+      </select>
+      <Err e={err} />{msg && <p className="ok">{msg}</p>}
+      {data.published && <div className="notice">Results are published. The ranking is locked.</div>}
+
+      <section className="card">
+        <table>
+          <thead><tr><th>Rank</th><th>Applicant</th><th>Score</th><th>Breakdown</th><th>Decision</th><th>Override</th></tr></thead>
+          <tbody>
+            {data.ranked.map((r) => (
+              <Fragment key={r.application_id}>
+                <tr>
+                  <td>{r.rank}{r.rank !== r.auto_rank && <span className="muted"> (auto {r.auto_rank})</span>}</td>
+                  <td>#{r.application_id} {r.name}</td>
+                  <td>{r.score}</td>
+                  <td className="muted">{r.breakdown.map((b) => `${label(b.field)}: ${b.value} × ${b.weight} = ${b.points}`).join("; ")}</td>
+                  <td><Badge s={r.decision} /></td>
+                  <td>{r.override ? `${r.override.action}: ${r.override.reason}` : "—"}</td>
+                </tr>
+                {r.rank === data.slots && (
+                  <tr>
+                    <td colSpan={6} style={{ borderTop: "3px solid #b91c1c", textAlign: "center", color: "#b91c1c" }}>
+                      — cut-off: {data.slots} slots —
+                    </td>
+                  </tr>
+                )}
+              </Fragment>
+            ))}
+            {data.excluded.map((r) => (
+              <tr key={"x" + r.application_id}>
+                <td>—</td><td>#{r.application_id} {r.name}</td><td>{r.score}</td><td />
+                <td><Badge s="EXCLUDED" /></td><td>{r.override.reason}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {data.ranked.length === 0 && <p className="muted">No verified applications yet.</p>}
+      </section>
+
+      {canOverride && !data.published && everyone.length > 0 && (
+        <section className="card">
+          <h3>Committee override <span className="muted">(approver / admin only, reason mandatory, logged)</span></h3>
+          <label>Applicant
+            <select value={f.application_id} onChange={(e) => setF({ ...f, application_id: e.target.value })}>
+              <option value="">Select…</option>
+              {everyone.map((r) => <option key={r.application_id} value={r.application_id}>#{r.application_id} {r.name}</option>)}
+            </select>
+          </label>
+          <label>Action
+            <select value={f.action} onChange={(e) => setF({ ...f, action: e.target.value })}>
+              <option value="PIN">Move to rank position</option>
+              <option value="EXCLUDE">Exclude from ranking</option>
+              <option value="CLEAR">Clear override</option>
+            </select>
+          </label>
+          {f.action === "PIN" && <label>Rank position<input type="number" min="1" value={f.rank} onChange={(e) => setF({ ...f, rank: e.target.value })} /></label>}
+          <label>Reason<textarea rows={2} value={f.reason} onChange={(e) => setF({ ...f, reason: e.target.value })} /></label>
+          <div className="actions">
+            <button className="btn secondary" disabled={!f.application_id} onClick={override}>Apply override</button>
+            <button className="btn" onClick={publish}>Publish results</button>
+          </div>
+        </section>
+      )}
+    </>
+  );
+}
+
+const PALETTE = ["#FF9933", "#138808", "#1d4ed8", "#9333ea", "#b91c1c", "#0891b2"];
+const Kpi = ({ t, v, s }) => (
+  <div className="kpi"><div className="kpi-v">{v}</div><div className="kpi-t">{t}</div>{s && <div className="muted">{s}</div>}</div>
+);
+const Box = ({ title, children }) => (
+  <section className="card"><h3>{title}</h3><div style={{ width: "100%", height: 260 }}>{children}</div></section>
+);
+const HBar = ({ data, color, w = 110 }) => (
+  <ResponsiveContainer>
+    <BarChart data={data} layout="vertical" margin={{ left: 10, right: 20 }}>
+      <CartesianGrid strokeDasharray="3 3" />
+      <XAxis type="number" allowDecimals={false} /><YAxis type="category" dataKey="name" width={w} />
+      <Tooltip /><Bar dataKey="value" fill={color} />
+    </BarChart>
+  </ResponsiveContainer>
+);
+const VBar = ({ data, color }) => (
+  <ResponsiveContainer>
+    <BarChart data={data}>
+      <CartesianGrid strokeDasharray="3 3" />
+      <XAxis dataKey="name" /><YAxis allowDecimals={false} /><Tooltip /><Bar dataKey="value" fill={color} />
+    </BarChart>
+  </ResponsiveContainer>
+);
+const Pie1 = ({ data }) => (
+  <ResponsiveContainer>
+    <PieChart>
+      <Pie data={data} dataKey="value" nameKey="name" outerRadius={85} label>
+        {data.map((_, i) => <Cell key={i} fill={PALETTE[i % PALETTE.length]} />)}
+      </Pie>
+      <Tooltip /><Legend />
+    </PieChart>
+  </ResponsiveContainer>
+);
+
+export function Ministry() {
+  const [d, setD] = useState(null);
+  const [err, setErr] = useState("");
+  useEffect(() => { api("/ministry/dashboard").then(setD).catch((e) => setErr(e.message)); }, []);
+  if (!d) return <><Err e={err} /><p>Loading…</p></>;
+  const k = d.kpis;
+  return (
+    <>
+      <h2>Ministry dashboard</h2>
+      {d.has_demo_data && <div className="notice">This view contains <b>synthetic demo data</b> (accounts ending @example.test). No real applicant is shown.</div>}
+      <div className="kpis">
+        <Kpi t="Applications" v={k.total} />
+        <Kpi t="Submitted" v={k.submitted} />
+        <Kpi t="Verified" v={k.verified} />
+        <Kpi t="Selected" v={k.selected} />
+        <Kpi t="Pending review" v={k.pending} s={`oldest ${k.oldest_pending_days} days`} />
+        <Kpi t="Avg. processing" v={k.avg_days === null ? "—" : k.avg_days + " d"} s={k.median_days === null ? "" : `median ${k.median_days} d`} />
+        <Kpi t="Deficiency rate" v={k.deficiency_rate + "%"} s="of officer decisions" />
+      </div>
+
+      <div className="grid2">
+        <Box title="Application funnel"><HBar data={d.funnel} color="#138808" w={90} /></Box>
+        <Box title="Applications by state (top 12)"><HBar data={d.by_state} color="#FF9933" w={120} /></Box>
+        <Box title="Gender split"><Pie1 data={d.by_gender} /></Box>
+        <Box title="Automatic eligibility outcome"><Pie1 data={d.eligibility} /></Box>
+        <Box title="Time taken per review (days)"><VBar data={d.processing_buckets} color="#1d4ed8" /></Box>
+        <Box title="Ageing of pending applications"><VBar data={d.ageing} color="#b91c1c" /></Box>
+        <Box title="Decisions per officer">
+          <ResponsiveContainer>
+            <BarChart data={d.by_officer}>
+              <CartesianGrid strokeDasharray="3 3" />
+              <XAxis dataKey="name" /><YAxis allowDecimals={false} /><Tooltip /><Legend />
+              <Bar dataKey="VERIFIED" stackId="a" fill="#138808" />
+              <Bar dataKey="DEFICIENT" stackId="a" fill="#d97706" />
+              <Bar dataKey="REJECTED" stackId="a" fill="#b91c1c" />
+            </BarChart>
+          </ResponsiveContainer>
+        </Box>
+        <Box title="Status of all applications"><Pie1 data={d.status} /></Box>
+      </div>
+
+      <section className="card">
+        <h3>Scheme-wise performance</h3>
+        <table>
+          <thead><tr><th>Scheme</th><th>Started</th><th>Submitted</th><th>Verified</th><th>Selected</th></tr></thead>
+          <tbody>{d.by_scheme.map((s) => <tr key={s.scheme}><td>{s.scheme}</td><td>{s.started}</td><td>{s.submitted}</td><td>{s.verified}</td><td>{s.selected}</td></tr>)}</tbody>
+        </table>
+      </section>
+
+      <section className="card">
+        <h3>Top deficiency and rejection reasons</h3>
+        {d.top_reasons.length === 0 && <p className="muted">No deficiency or rejection remarks yet.</p>}
+        <table><tbody>{d.top_reasons.map((r) => <tr key={r.name}><td>{r.name}</td><td>{r.value}</td></tr>)}</tbody></table>
+      </section>
     </>
   );
 }

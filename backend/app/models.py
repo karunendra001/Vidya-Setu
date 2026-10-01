@@ -57,3 +57,16 @@ class AuditLog(Base):
     entity_id: Mapped[int] = mapped_column(Integer)
     detail: Mapped[dict] = mapped_column(JSON, default=dict)
     at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class RankOverride(Base):
+    """Committee override of the automatic ranking. One per application."""
+    __tablename__ = "rank_overrides"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    scheme_id: Mapped[int] = mapped_column(ForeignKey("schemes.id"))
+    application_id: Mapped[int] = mapped_column(ForeignKey("applications.id"), unique=True)
+    action: Mapped[str] = mapped_column(String)            # PIN | EXCLUDE
+    rank: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reason: Mapped[str] = mapped_column(String, default="")
+    set_by: Mapped[int] = mapped_column(Integer)
+    at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)    

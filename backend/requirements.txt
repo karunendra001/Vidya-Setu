@@ -6,3 +6,7 @@ python-multipart
 httpx
 pytest
 bcrypt
+pytesseract
+pillow
+pdf2image
+rapidfuzz
