@@ -25,7 +25,9 @@ COMMITTEE = ("approver", "admin")
 FINAL = ("SELECTED", "WAITLISTED", "NOT_SELECTED")
 
 app = FastAPI(title="Vidya Setu: MoTA Scholarship & Fellowship Management System")
-
+@app.get("/")
+def root():
+    return {"message": "Vidya Setu API is running"}
 # React dev server (Vite) by default; override with CORS_ORIGINS="https://a.gov.in,https://b.gov.in"
 app.add_middleware(
     CORSMiddleware,
